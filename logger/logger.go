@@ -12,7 +12,13 @@ var (
 	infoColor    = color.New(color.FgBlue)
 	errorColor   = color.New(color.FgRed)
 	successColor = color.New(color.FgGreen)
+	silent       bool
 )
+
+// SetSilent toggles suppression for non-default loggers.
+func SetSilent(value bool) {
+	silent = value
+}
 
 // Info prints informational messages in blue to stdout.
 func Info(format string, args ...any) {
@@ -40,6 +46,10 @@ func Default(format string, args ...any) {
 }
 
 func log(w io.Writer, clr *color.Color, prefix string, format string, args ...any) {
+	if silent && prefix != "" {
+		return
+	}
+
 	message := fmt.Sprintf(format, args...)
 	if prefix != "" {
 		message = fmt.Sprintf("[%s] %s", prefix, message)

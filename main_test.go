@@ -64,6 +64,19 @@ func TestParseArgs_ExecCommand(t *testing.T) {
 	}
 }
 
+func TestParseArgs_SilentFlag(t *testing.T) {
+	args := []string{"-silent"}
+
+	opts, err := parseArgs(args)
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+
+	if !opts.Silent {
+		t.Fatal("expected Silent to be true")
+	}
+}
+
 func TestHandleAddCommand_SavesConfigEntry(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &configData{
@@ -114,6 +127,46 @@ func TestHandleAddCommand_SavesConfigEntry(t *testing.T) {
 
 	if err := handleAddCommand(cmd, cfg, configPath); err == nil {
 		t.Fatal("expected error when adding the same command name twice")
+	}
+}
+
+func TestHandleAddCommand_SanitizesPathsUnderHome(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	commandsDir := filepath.Join(dir, "commands")
+	if err := os.MkdirAll(commandsDir, 0o755); err != nil {
+		t.Fatalf("preparing commands dir: %v", err)
+	}
+
+	scriptPath := filepath.Join(commandsDir, "deploy.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Scalars:  map[string]string{"commands_folder": "$HOME/commands"},
+		Commands: make(map[string]commandDefinition),
+	}
+
+	cmd := &addCommand{
+		fileName:    "deploy.sh",
+		commandName: "deploy",
+		description: "Run deployment",
+	}
+
+	if err := handleAddCommand(cmd, cfg, filepath.Join(dir, "config.toml")); err != nil {
+		t.Fatalf("handleAddCommand returned error: %v", err)
+	}
+
+	entry, ok := cfg.Commands["deploy"]
+	if !ok {
+		t.Fatal("expected deploy entry to exist")
+	}
+
+	expected := filepath.Join("$HOME", "commands", "deploy.sh")
+	if entry.Path != expected {
+		t.Fatalf("entry.Path = %q, want %q", entry.Path, expected)
 	}
 }
 
@@ -249,6 +302,72 @@ func TestHandleExecCommand_RunsScript(t *testing.T) {
 	}
 	if strings.TrimSpace(string(data)) != "executed" {
 		t.Fatalf("output = %q, want %q", strings.TrimSpace(string(data)), "executed")
+	}
+}
+
+func TestHandleExecCommand_ExpandsEnvPaths(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	scriptPath := filepath.Join(dir, "env.sh")
+	outputPath := filepath.Join(dir, "env-output.txt")
+	content := fmt.Sprintf("#!/bin/sh\necho env > %q\n", outputPath)
+	if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"env": {
+				Path:        filepath.Join("$HOME", "env.sh"),
+				Description: "Env script",
+			},
+		},
+		Executors: map[string]string{
+			"sh": "sh {{path}}",
+		},
+	}
+
+	if err := handleExecCommand(&execCommand{name: "env"}, cfg); err != nil {
+		t.Fatalf("handleExecCommand returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "env" {
+		t.Fatalf("output = %q, want env", strings.TrimSpace(string(data)))
+	}
+}
+
+func TestHandleExecCommand_LogsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "noop.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"noop": {
+				Path:        scriptPath,
+				Description: "a no-op command",
+			},
+		},
+		Executors: map[string]string{
+			"sh": "sh {{path}}",
+		},
+	}
+
+	output := captureStdout(t, func() {
+		if err := handleExecCommand(&execCommand{name: "noop"}, cfg); err != nil {
+			t.Fatalf("handleExecCommand returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "Execute noop done!") {
+		t.Fatalf("output = %q, want success log", output)
 	}
 }
 

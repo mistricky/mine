@@ -20,6 +20,7 @@ const version = "0.1.0"
 type cliOptions struct {
 	ShowVersion bool
 	ConfigName  string
+	Silent      bool
 	ConfigCmd   *configCommand
 	AddCmd      *addCommand
 	ListCmd     *listCommand
@@ -62,6 +63,9 @@ const (
 
 func main() {
 	opts, err := parseArgs(os.Args[1:])
+	if opts.Silent {
+		logger.SetSilent(true)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, flag.ErrHelp):
@@ -139,6 +143,7 @@ func parseArgs(args []string) (cliOptions, error) {
 	fs.BoolVar(&opts.ShowVersion, "v", false, "print version information")
 	fs.BoolVar(&opts.ShowVersion, "version", false, "print version information")
 	fs.StringVar(&opts.ConfigName, "config-file", "", "config file name or path")
+	fs.BoolVar(&opts.Silent, "silent", false, "suppress non-default logs")
 
 	if err := fs.Parse(remaining); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -309,9 +314,14 @@ func handleConfigCommand(cmd *configCommand, configPath string, cfg *configData)
 }
 
 func handleAddCommand(cmd *addCommand, cfg *configData, configPath string) error {
-	commandsDir, ok := cfg.Scalars["commands_folder"]
-	if !ok || commandsDir == "" {
+	commandsDirRaw, ok := cfg.Scalars["commands_folder"]
+	if !ok || commandsDirRaw == "" {
 		return fmt.Errorf("commands_folder is not configured")
+	}
+
+	commandsDir, err := resolveUserPath(commandsDirRaw)
+	if err != nil {
+		return fmt.Errorf("unable to resolve commands_folder: %w", err)
 	}
 
 	if err := os.MkdirAll(commandsDir, 0o755); err != nil {
@@ -319,14 +329,14 @@ func handleAddCommand(cmd *addCommand, cfg *configData, configPath string) error
 	}
 
 	var commandPath string
-	if filepath.IsAbs(cmd.fileName) || strings.ContainsRune(cmd.fileName, os.PathSeparator) {
-		abs, err := filepath.Abs(cmd.fileName)
+	if isSimpleCommandName(cmd.fileName) {
+		commandPath = filepath.Join(commandsDir, cmd.fileName)
+	} else {
+		resolved, err := resolveUserPath(cmd.fileName)
 		if err != nil {
 			return fmt.Errorf("unable to resolve path %q: %w", cmd.fileName, err)
 		}
-		commandPath = abs
-	} else {
-		commandPath = filepath.Join(commandsDir, cmd.fileName)
+		commandPath = resolved
 	}
 
 	info, err := os.Stat(commandPath)
@@ -345,7 +355,7 @@ func handleAddCommand(cmd *addCommand, cfg *configData, configPath string) error
 	}
 
 	cfg.Commands[cmd.commandName] = commandDefinition{
-		Path:        commandPath,
+		Path:        collapseHomePath(commandPath),
 		Description: cmd.description,
 	}
 
@@ -367,7 +377,12 @@ func handleExecCommand(cmd *execCommand, cfg *configData) error {
 		return fmt.Errorf("command %q has no path configured", cmd.name)
 	}
 
-	info, err := os.Stat(entry.Path)
+	resolvedPath, err := resolveUserPath(entry.Path)
+	if err != nil {
+		return fmt.Errorf("unable to resolve command path %q: %w", entry.Path, err)
+	}
+
+	info, err := os.Stat(resolvedPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("command file %q does not exist", entry.Path)
@@ -378,7 +393,7 @@ func handleExecCommand(cmd *execCommand, cfg *configData) error {
 		return fmt.Errorf("command path %q is a directory, expected file", entry.Path)
 	}
 
-	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(entry.Path)), ".")
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(resolvedPath)), ".")
 	if ext == "" {
 		return fmt.Errorf("command file %q has no extension", entry.Path)
 	}
@@ -388,7 +403,7 @@ func handleExecCommand(cmd *execCommand, cfg *configData) error {
 		return fmt.Errorf("no executor configured for extension %q", ext)
 	}
 
-	commandString, err := buildExecutorCommand(executorTemplate, entry.Path, ext)
+	commandString, err := buildExecutorCommand(executorTemplate, resolvedPath, ext)
 	if err != nil {
 		return err
 	}
@@ -402,6 +417,7 @@ func handleExecCommand(cmd *execCommand, cfg *configData) error {
 		return fmt.Errorf("executor command failed: %w", err)
 	}
 
+	logger.Success("Execute %s done!\n", cmd.name)
 	return nil
 }
 
@@ -442,4 +458,17 @@ func shellQuote(path string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+}
+
+func isSimpleCommandName(value string) bool {
+	if value == "" {
+		return false
+	}
+	if filepath.IsAbs(value) {
+		return false
+	}
+	if strings.HasPrefix(value, "~") || strings.HasPrefix(value, "$") {
+		return false
+	}
+	return !strings.ContainsRune(value, os.PathSeparator)
 }
