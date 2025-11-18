@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/mistricky/mine/logger"
 )
@@ -17,12 +19,19 @@ type cliOptions struct {
 	ShowVersion bool
 	ConfigName  string
 	ConfigCmd   *configCommand
+	AddCmd      *addCommand
 }
 
 type configCommand struct {
 	mode  configMode
 	key   string
 	value string
+}
+
+type addCommand struct {
+	fileName    string
+	commandName string
+	description string
 }
 
 type flagParseError struct {
@@ -75,6 +84,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if opts.AddCmd != nil {
+		if err := handleAddCommand(opts.AddCmd, configValues, configPath); err != nil {
+			logger.Error("%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if opts.ConfigCmd != nil {
 		handleConfigCommand(opts.ConfigCmd, configPath, configValues)
 		return
@@ -92,6 +109,9 @@ func parseArgs(args []string) (cliOptions, error) {
 
 	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	fs.Usage = func() {
+		printUsage(fs)
+	}
 
 	fs.BoolVar(&opts.ShowVersion, "v", false, "print version information")
 	fs.BoolVar(&opts.ShowVersion, "version", false, "print version information")
@@ -99,17 +119,56 @@ func parseArgs(args []string) (cliOptions, error) {
 
 	if err := fs.Parse(remaining); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			printUsage(fs)
 			return opts, err
 		}
 		return opts, flagParseError{err: err}
 	}
 
 	if fs.NArg() > 0 {
-		return opts, fmt.Errorf("unexpected arguments: %v", fs.Args())
+		subcommand := fs.Arg(0)
+		switch subcommand {
+		case "add":
+			addCmd, err := parseAddCommand(fs.Args()[1:])
+			if err != nil {
+				return opts, err
+			}
+			opts.AddCmd = addCmd
+		default:
+			return opts, fmt.Errorf("unknown command: %s", subcommand)
+		}
+	}
+
+	if opts.ConfigCmd != nil && opts.AddCmd != nil {
+		return opts, fmt.Errorf("cannot combine -config with other commands")
 	}
 
 	return opts, nil
+}
+
+func parseAddCommand(args []string) (*addCommand, error) {
+	addSet := flag.NewFlagSet("add", flag.ContinueOnError)
+	addSet.SetOutput(io.Discard)
+	addSet.Usage = func() {
+		printUsage(addSet)
+	}
+
+	if err := addSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, err
+		}
+		return nil, flagParseError{err: err}
+	}
+
+	if addSet.NArg() < 3 {
+		return nil, fmt.Errorf("usage: %s add filename command-name description", appName)
+	}
+
+	parsed := addSet.Args()
+	return &addCommand{
+		fileName:    parsed[0],
+		commandName: parsed[1],
+		description: strings.Join(parsed[2:], " "),
+	}, nil
 }
 
 func printUsage(fs *flag.FlagSet) {
@@ -148,20 +207,20 @@ func extractConfigCommand(args []string) ([]string, *configCommand, error) {
 	return clean, nil, nil
 }
 
-func handleConfigCommand(cmd *configCommand, configPath string, values map[string]string) {
+func handleConfigCommand(cmd *configCommand, configPath string, cfg *configData) {
 	switch cmd.mode {
 	case configModePrintAll:
-		logger.Default("%s", encodeConfig(values))
+		logger.Default("%s", encodeConfig(cfg))
 	case configModeGet:
-		value, ok := values[cmd.key]
+		value, ok := cfg.Scalars[cmd.key]
 		if !ok {
 			logger.Error("config item %q not found\n", cmd.key)
 			os.Exit(1)
 		}
 		logger.Default("%s\n", value)
 	case configModeSet:
-		values[cmd.key] = cmd.value
-		if err := writeConfig(configPath, values); err != nil {
+		cfg.Scalars[cmd.key] = cmd.value
+		if err := writeConfig(configPath, cfg); err != nil {
 			logger.Error("%v\n", err)
 			os.Exit(1)
 		}
@@ -170,4 +229,53 @@ func handleConfigCommand(cmd *configCommand, configPath string, values map[strin
 		logger.Error("unknown config command\n")
 		os.Exit(1)
 	}
+}
+
+func handleAddCommand(cmd *addCommand, cfg *configData, configPath string) error {
+	commandsDir, ok := cfg.Scalars["commands_folder"]
+	if !ok || commandsDir == "" {
+		return fmt.Errorf("commands_folder is not configured")
+	}
+
+	if err := os.MkdirAll(commandsDir, 0o755); err != nil {
+		return fmt.Errorf("unable to prepare commands folder: %w", err)
+	}
+
+	var commandPath string
+	if filepath.IsAbs(cmd.fileName) || strings.ContainsRune(cmd.fileName, os.PathSeparator) {
+		abs, err := filepath.Abs(cmd.fileName)
+		if err != nil {
+			return fmt.Errorf("unable to resolve path %q: %w", cmd.fileName, err)
+		}
+		commandPath = abs
+	} else {
+		commandPath = filepath.Join(commandsDir, cmd.fileName)
+	}
+
+	info, err := os.Stat(commandPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("command file %q does not exist", commandPath)
+		}
+		return fmt.Errorf("unable to inspect command file %q: %w", commandPath, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("command path %q is a directory, expected file", commandPath)
+	}
+
+	if _, exists := cfg.Commands[cmd.commandName]; exists {
+		return fmt.Errorf("command %q already exists", cmd.commandName)
+	}
+
+	cfg.Commands[cmd.commandName] = commandDefinition{
+		Path:        commandPath,
+		Description: cmd.description,
+	}
+
+	if err := writeConfig(configPath, cfg); err != nil {
+		return fmt.Errorf("unable to update config: %w", err)
+	}
+
+	logger.Success("command %q saved\n", cmd.commandName)
+	return nil
 }
