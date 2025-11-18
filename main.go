@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/mistricky/mine/logger"
@@ -20,6 +22,8 @@ type cliOptions struct {
 	ConfigName  string
 	ConfigCmd   *configCommand
 	AddCmd      *addCommand
+	ListCmd     *listCommand
+	ExecCmd     *execCommand
 }
 
 type configCommand struct {
@@ -32,6 +36,12 @@ type addCommand struct {
 	fileName    string
 	commandName string
 	description string
+}
+
+type listCommand struct{}
+
+type execCommand struct {
+	name string
 }
 
 type flagParseError struct {
@@ -92,6 +102,19 @@ func main() {
 		return
 	}
 
+	if opts.ExecCmd != nil {
+		if err := handleExecCommand(opts.ExecCmd, configValues); err != nil {
+			logger.Error("%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if opts.ListCmd != nil {
+		handleListCommand(configValues)
+		return
+	}
+
 	if opts.ConfigCmd != nil {
 		handleConfigCommand(opts.ConfigCmd, configPath, configValues)
 		return
@@ -133,12 +156,24 @@ func parseArgs(args []string) (cliOptions, error) {
 				return opts, err
 			}
 			opts.AddCmd = addCmd
+		case "ls":
+			listCmd, err := parseListCommand(fs.Args()[1:])
+			if err != nil {
+				return opts, err
+			}
+			opts.ListCmd = listCmd
+		case "exec":
+			execCmd, err := parseExecCommand(fs.Args()[1:])
+			if err != nil {
+				return opts, err
+			}
+			opts.ExecCmd = execCmd
 		default:
 			return opts, fmt.Errorf("unknown command: %s", subcommand)
 		}
 	}
 
-	if opts.ConfigCmd != nil && opts.AddCmd != nil {
+	if opts.ConfigCmd != nil && (opts.AddCmd != nil || opts.ListCmd != nil || opts.ExecCmd != nil) {
 		return opts, fmt.Errorf("cannot combine -config with other commands")
 	}
 
@@ -169,6 +204,48 @@ func parseAddCommand(args []string) (*addCommand, error) {
 		commandName: parsed[1],
 		description: strings.Join(parsed[2:], " "),
 	}, nil
+}
+
+func parseListCommand(args []string) (*listCommand, error) {
+	lsSet := flag.NewFlagSet("ls", flag.ContinueOnError)
+	lsSet.SetOutput(io.Discard)
+	lsSet.Usage = func() {
+		printUsage(lsSet)
+	}
+
+	if err := lsSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, err
+		}
+		return nil, flagParseError{err: err}
+	}
+
+	if lsSet.NArg() > 0 {
+		return nil, fmt.Errorf("usage: %s ls", appName)
+	}
+
+	return &listCommand{}, nil
+}
+
+func parseExecCommand(args []string) (*execCommand, error) {
+	execSet := flag.NewFlagSet("exec", flag.ContinueOnError)
+	execSet.SetOutput(io.Discard)
+	execSet.Usage = func() {
+		printUsage(execSet)
+	}
+
+	if err := execSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, err
+		}
+		return nil, flagParseError{err: err}
+	}
+
+	if execSet.NArg() != 1 {
+		return nil, fmt.Errorf("usage: %s exec name", appName)
+	}
+
+	return &execCommand{name: execSet.Arg(0)}, nil
 }
 
 func printUsage(fs *flag.FlagSet) {
@@ -278,4 +355,91 @@ func handleAddCommand(cmd *addCommand, cfg *configData, configPath string) error
 
 	logger.Success("command %q saved\n", cmd.commandName)
 	return nil
+}
+
+func handleExecCommand(cmd *execCommand, cfg *configData) error {
+	entry, ok := cfg.Commands[cmd.name]
+	if !ok {
+		return fmt.Errorf("command %q not found", cmd.name)
+	}
+
+	if entry.Path == "" {
+		return fmt.Errorf("command %q has no path configured", cmd.name)
+	}
+
+	info, err := os.Stat(entry.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("command file %q does not exist", entry.Path)
+		}
+		return fmt.Errorf("unable to inspect command file %q: %w", entry.Path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("command path %q is a directory, expected file", entry.Path)
+	}
+
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(entry.Path)), ".")
+	if ext == "" {
+		return fmt.Errorf("command file %q has no extension", entry.Path)
+	}
+
+	executorTemplate, ok := cfg.Executors[ext]
+	if !ok {
+		return fmt.Errorf("no executor configured for extension %q", ext)
+	}
+
+	commandString, err := buildExecutorCommand(executorTemplate, entry.Path, ext)
+	if err != nil {
+		return err
+	}
+
+	runCmd := exec.Command("sh", "-c", commandString)
+	runCmd.Stdout = os.Stdout
+	runCmd.Stderr = os.Stderr
+	runCmd.Stdin = os.Stdin
+
+	if err := runCmd.Run(); err != nil {
+		return fmt.Errorf("executor command failed: %w", err)
+	}
+
+	return nil
+}
+
+func handleListCommand(cfg *configData) {
+	for _, line := range formatCommandList(cfg) {
+		logger.Default("%s\n", line)
+	}
+}
+
+func formatCommandList(cfg *configData) []string {
+	if len(cfg.Commands) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(cfg.Commands))
+	for name := range cfg.Commands {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	lines := make([]string, 0, len(names))
+	for _, name := range names {
+		lines = append(lines, fmt.Sprintf("%s  %s", name, cfg.Commands[name].Description))
+	}
+	return lines
+}
+
+func buildExecutorCommand(template, scriptPath, ext string) (string, error) {
+	if !strings.Contains(template, "{{path}}") {
+		return "", fmt.Errorf("executor command for extension %q must include {{path}}", ext)
+	}
+	quoted := shellQuote(scriptPath)
+	return strings.ReplaceAll(template, "{{path}}", quoted), nil
+}
+
+func shellQuote(path string) string {
+	if path == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
 }

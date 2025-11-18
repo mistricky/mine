@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +31,36 @@ func TestParseArgs_AddCommand(t *testing.T) {
 
 	if opts.AddCmd.description != "Run the full deployment pipeline" {
 		t.Fatalf("description = %q, want %q", opts.AddCmd.description, "Run the full deployment pipeline")
+	}
+}
+
+func TestParseArgs_ListCommand(t *testing.T) {
+	args := []string{"ls"}
+
+	opts, err := parseArgs(args)
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+
+	if opts.ListCmd == nil {
+		t.Fatal("expected ListCmd to be populated")
+	}
+}
+
+func TestParseArgs_ExecCommand(t *testing.T) {
+	args := []string{"exec", "deploy"}
+
+	opts, err := parseArgs(args)
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+
+	if opts.ExecCmd == nil {
+		t.Fatal("expected ExecCmd to be populated")
+	}
+
+	if opts.ExecCmd.name != "deploy" {
+		t.Fatalf("ExecCmd.name = %q, want %q", opts.ExecCmd.name, "deploy")
 	}
 }
 
@@ -151,6 +183,24 @@ func TestHandleAddCommand_MissingConfig(t *testing.T) {
 	}
 }
 
+func TestHandleListCommand_PrintsSortedCommands(t *testing.T) {
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"deploy":  {Description: "Run deployment"},
+			"cleanup": {Description: "Cleanup artifacts"},
+		},
+	}
+
+	output := captureStdout(t, func() {
+		handleListCommand(cfg)
+	})
+
+	expected := "cleanup  Cleanup artifacts\ndeploy  Run deployment\n"
+	if output != expected {
+		t.Fatalf("output = %q, want %q", output, expected)
+	}
+}
+
 func TestHandleAddCommand_ErrorsWhenFileMissing(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &configData{
@@ -166,4 +216,114 @@ func TestHandleAddCommand_ErrorsWhenFileMissing(t *testing.T) {
 	if err := handleAddCommand(cmd, cfg, filepath.Join(dir, "config.toml")); err == nil {
 		t.Fatal("expected error when script file does not exist")
 	}
+}
+
+func TestHandleExecCommand_RunsScript(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "hello.sh")
+	outputPath := filepath.Join(dir, "exec-output.txt")
+	content := fmt.Sprintf("#!/bin/sh\necho executed > %q\n", outputPath)
+	if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"hello": {
+				Path:        scriptPath,
+				Description: "demo",
+			},
+		},
+		Executors: map[string]string{
+			"sh": "sh {{path}}",
+		},
+	}
+
+	if err := handleExecCommand(&execCommand{name: "hello"}, cfg); err != nil {
+		t.Fatalf("handleExecCommand returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "executed" {
+		t.Fatalf("output = %q, want %q", strings.TrimSpace(string(data)), "executed")
+	}
+}
+
+func TestHandleExecCommand_NoExecutorConfigured(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "task.rb")
+	if err := os.WriteFile(scriptPath, []byte("puts 'hi'\n"), 0o644); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"ruby-task": {Path: scriptPath},
+		},
+		Executors: map[string]string{},
+	}
+
+	err := handleExecCommand(&execCommand{name: "ruby-task"}, cfg)
+	if err == nil {
+		t.Fatal("expected error when executor is missing")
+	}
+	if !strings.Contains(err.Error(), "no executor configured") {
+		t.Fatalf("error = %v, want no executor configured", err)
+	}
+}
+
+func TestHandleExecCommand_MissingPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "noop.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"noop": {Path: scriptPath},
+		},
+		Executors: map[string]string{
+			"sh": "sh",
+		},
+	}
+
+	err := handleExecCommand(&execCommand{name: "noop"}, cfg)
+	if err == nil {
+		t.Fatal("expected error when executor template is invalid")
+	}
+	if !strings.Contains(err.Error(), "must include {{path}}") {
+		t.Fatalf("error = %v, want placeholder message", err)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating pipe: %v", err)
+	}
+	defer r.Close()
+
+	originalStdout := os.Stdout
+	os.Stdout = w
+	defer func() {
+		os.Stdout = originalStdout
+	}()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing writer: %v", err)
+	}
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading pipe: %v", err)
+	}
+
+	return string(data)
 }

@@ -22,8 +22,9 @@ type commandDefinition struct {
 }
 
 type configData struct {
-	Scalars  map[string]string
-	Commands map[string]commandDefinition
+	Scalars   map[string]string
+	Commands  map[string]commandDefinition
+	Executors map[string]string
 }
 
 func resolveConfigPath(name string) (string, error) {
@@ -96,7 +97,8 @@ func defaultConfig(configDir string) configData {
 		Scalars: map[string]string{
 			"commands_folder": filepath.Join(configDir, "commands"),
 		},
-		Commands: make(map[string]commandDefinition),
+		Commands:  make(map[string]commandDefinition),
+		Executors: defaultExecutors(),
 	}
 }
 
@@ -108,16 +110,19 @@ func loadConfig(path string) (configData, error) {
 	defer file.Close()
 
 	cfg := configData{
-		Scalars:  make(map[string]string),
-		Commands: make(map[string]commandDefinition),
+		Scalars:   make(map[string]string),
+		Commands:  make(map[string]commandDefinition),
+		Executors: make(map[string]string),
 	}
 
 	scanner := bufio.NewScanner(file)
 	currentCommand := ""
+	inExecutors := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			currentCommand = ""
+			inExecutors = false
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
@@ -126,16 +131,22 @@ func loadConfig(path string) (configData, error) {
 
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			if !strings.HasPrefix(section, "commands.") {
+			switch {
+			case section == "executors":
+				currentCommand = ""
+				inExecutors = true
+			case strings.HasPrefix(section, "commands."):
+				name := strings.TrimPrefix(section, "commands.")
+				if name == "" {
+					return configData{}, fmt.Errorf("invalid commands section: %q", section)
+				}
+				currentCommand = name
+				inExecutors = false
+				if _, ok := cfg.Commands[currentCommand]; !ok {
+					cfg.Commands[currentCommand] = commandDefinition{}
+				}
+			default:
 				return configData{}, fmt.Errorf("unknown section: %q", section)
-			}
-			name := strings.TrimPrefix(section, "commands.")
-			if name == "" {
-				return configData{}, fmt.Errorf("invalid commands section: %q", section)
-			}
-			currentCommand = name
-			if _, ok := cfg.Commands[currentCommand]; !ok {
-				cfg.Commands[currentCommand] = commandDefinition{}
 			}
 			continue
 		}
@@ -154,6 +165,11 @@ func loadConfig(path string) (configData, error) {
 		value, err := parseTomlValue(valueText)
 		if err != nil {
 			return configData{}, fmt.Errorf("invalid value for %q: %w", key, err)
+		}
+
+		if inExecutors {
+			cfg.Executors[strings.ToLower(key)] = value
+			continue
 		}
 
 		if currentCommand != "" {
@@ -177,6 +193,7 @@ func loadConfig(path string) (configData, error) {
 		return configData{}, err
 	}
 
+	cfg.Executors = mergeDefaultExecutors(cfg.Executors)
 	return cfg, nil
 }
 
@@ -216,6 +233,21 @@ func encodeConfig(cfg *configData) string {
 		builder.WriteString(fmt.Sprintf("%s = %s\n", key, strconv.Quote(cfg.Scalars[key])))
 	}
 
+	if len(cfg.Executors) > 0 {
+		if builder.Len() > 0 {
+			builder.WriteString("\n")
+		}
+		builder.WriteString("[executors]\n")
+		executorKeys := make([]string, 0, len(cfg.Executors))
+		for key := range cfg.Executors {
+			executorKeys = append(executorKeys, key)
+		}
+		sort.Strings(executorKeys)
+		for _, key := range executorKeys {
+			builder.WriteString(fmt.Sprintf("%s = %s\n", key, strconv.Quote(cfg.Executors[key])))
+		}
+	}
+
 	if len(cfg.Commands) == 0 {
 		return builder.String()
 	}
@@ -241,4 +273,25 @@ func encodeConfig(cfg *configData) string {
 	}
 
 	return builder.String()
+}
+
+func mergeDefaultExecutors(existing map[string]string) map[string]string {
+	base := defaultExecutors()
+	if existing == nil {
+		return base
+	}
+	for k, v := range base {
+		if _, ok := existing[k]; !ok {
+			existing[k] = v
+		}
+	}
+	return existing
+}
+
+func defaultExecutors() map[string]string {
+	return map[string]string{
+		"js": "node {{path}}",
+		"py": "python {{path}}",
+		"sh": "sh {{path}}",
+	}
 }
