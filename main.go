@@ -174,7 +174,11 @@ func parseArgs(args []string) (cliOptions, error) {
 			}
 			opts.ExecCmd = execCmd
 		default:
-			return opts, fmt.Errorf("unknown command: %s", subcommand)
+			if fs.NArg() == 1 {
+				opts.ExecCmd = &execCommand{name: subcommand}
+			} else {
+				return opts, fmt.Errorf("unknown command: %s", subcommand)
+			}
 		}
 	}
 
@@ -393,19 +397,20 @@ func handleExecCommand(cmd *execCommand, cfg *configData) error {
 		return fmt.Errorf("command path %q is a directory, expected file", entry.Path)
 	}
 
+	var commandString string
 	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(resolvedPath)), ".")
 	if ext == "" {
-		return fmt.Errorf("command file %q has no extension", entry.Path)
-	}
+		commandString = fmt.Sprintf("sh %s", shellQuote(resolvedPath))
+	} else {
+		executorTemplate, ok := cfg.Executors[ext]
+		if !ok {
+			return fmt.Errorf("no executor configured for extension %q", ext)
+		}
 
-	executorTemplate, ok := cfg.Executors[ext]
-	if !ok {
-		return fmt.Errorf("no executor configured for extension %q", ext)
-	}
-
-	commandString, err := buildExecutorCommand(executorTemplate, resolvedPath, ext)
-	if err != nil {
-		return err
+		commandString, err = buildExecutorCommand(executorTemplate, resolvedPath, ext)
+		if err != nil {
+			return err
+		}
 	}
 
 	runCmd := exec.Command("sh", "-c", commandString)

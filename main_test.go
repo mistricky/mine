@@ -77,6 +77,23 @@ func TestParseArgs_SilentFlag(t *testing.T) {
 	}
 }
 
+func TestParseArgs_DefaultExecCommand(t *testing.T) {
+	args := []string{"deploy"}
+
+	opts, err := parseArgs(args)
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+
+	if opts.ExecCmd == nil {
+		t.Fatal("expected ExecCmd to be populated")
+	}
+
+	if opts.ExecCmd.name != "deploy" {
+		t.Fatalf("ExecCmd.name = %q, want %q", opts.ExecCmd.name, "deploy")
+	}
+}
+
 func TestHandleAddCommand_SavesConfigEntry(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &configData{
@@ -302,6 +319,38 @@ func TestHandleExecCommand_RunsScript(t *testing.T) {
 	}
 	if strings.TrimSpace(string(data)) != "executed" {
 		t.Fatalf("output = %q, want %q", strings.TrimSpace(string(data)), "executed")
+	}
+}
+
+func TestHandleExecCommand_DefaultsToShellWhenNoExtension(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "hello")
+	outputPath := filepath.Join(dir, "exec-output-noext.txt")
+	content := fmt.Sprintf("#!/bin/sh\necho noext > %q\n", outputPath)
+	if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
+		t.Fatalf("writing script: %v", err)
+	}
+
+	cfg := &configData{
+		Commands: map[string]commandDefinition{
+			"hello": {
+				Path:        scriptPath,
+				Description: "demo",
+			},
+		},
+		Executors: map[string]string{},
+	}
+
+	if err := handleExecCommand(&execCommand{name: "hello"}, cfg); err != nil {
+		t.Fatalf("handleExecCommand returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "noext" {
+		t.Fatalf("output = %q, want %q", strings.TrimSpace(string(data)), "noext")
 	}
 }
 
